@@ -23,6 +23,12 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a DepthwiseSeparableConv block fixture (path to its .safetensors).")
     var convGate: String?
 
+    @Option(help: "Gate a DWResnetBlock2D fixture (path to its .safetensors).")
+    var resnetGate: String?
+
+    @Option(help: "GroupNorm epsilon to gate with. The block default is 1e-6 and the diffusers UNet default is 1e-5; the gate decides which is actually in force.")
+    var normEps: Float = 1e-6
+
     @Flag(inversion: .prefixedNo,
           help: "Pin to the CPU stream — GPU fp32 noise (~8e-4/op) both hides and mimics op bugs. Use --no-cpu for a GPU smoke.")
     var cpu: Bool = true
@@ -32,7 +38,31 @@ struct MoebiusGate: ParsableCommand {
         var ran = false
         if lambdaGate { try runLambdaGate(); ran = true }
         if let convGate { try runConvGate(path: convGate); ran = true }
-        if !ran { print("nothing to do — pass --lambda-gate and/or --conv-gate <fixture>") }
+        if let resnetGate { try runResnetGate(path: resnetGate); ran = true }
+        if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
+    }
+
+    /// Gate one `DWResnetBlock2D` against its captured (hidden_states, temb) → output.
+    private func runResnetGate(path: String) throws {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw MoebiusError.fixtureNotFound(url.path)
+        }
+        let bundle = try MLX.loadArrays(url: url)
+        var weights: [String: MLXArray] = [:]
+        for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
+        guard let xNCHW = bundle["io.input0"], let temb = bundle["io.input1"],
+              let refNCHW = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.input0 / io.input1 / io.output")
+        }
+        print("\n\(url.deletingPathExtension().lastPathComponent)  x \(xNCHW.shape) temb \(temb.shape) -> \(refNCHW.shape)   [eps \(normEps)]")
+
+        let block = try DWResnetBlock2D(weights, eps: normEps)
+        let out = Layout.nhwcToNCHW(block(Layout.nchwToNHWC(xNCHW), temb: temb))
+        eval(out)
+        let failures = report("dw resnet", out, refNCHW)
+        print(failures == 0 ? "RESNET GATE: PASS" : "RESNET GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate one `DepthwiseSeparableConv` (conv_in / conv_out) against its captured I/O.

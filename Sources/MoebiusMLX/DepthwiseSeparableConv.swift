@@ -29,6 +29,14 @@ public struct DepthwiseSeparableConv {
     public let bn2: BatchNormParams
     public let groups: Int
     public let padding: Int
+    /// timm: `has_skip = (stride == 1 and in_chs == out_chs) and not noskip`.
+    ///
+    /// ⚠️ The SAME block class behaves differently depending on its channel configuration, and the
+    /// two places Moebius uses it first — `conv_in` (9→320) and `conv_out` (320→4) — are exactly
+    /// the configurations where the skip is ABSENT. Both gated green while this was unimplemented,
+    /// which is a reminder to gate a shared block in every configuration it appears in rather than
+    /// trusting the first. Inside `DWResnetBlock2D` the convs are 320→320, so the skip is live.
+    public let hasSkip: Bool
 
     /// Build from a flat weight dict holding the REFERENCE's PyTorch layouts. The conv transposes
     /// happen here — the same conversion the production weight loader performs — so the gate
@@ -48,6 +56,7 @@ public struct DepthwiseSeparableConv {
         self.bn2 = try BatchNormParams(weights, "\(p)bn2")
         self.groups = dw.dim(0)                 // fully depthwise: groups == in_chs
         self.padding = dw.dim(2) / 2            // timm resolves '' to 'same' for odd kernels
+        self.hasSkip = dw.dim(0) == pw.dim(0)   // in_chs == out_chs (stride is always 1 here)
     }
 
     /// - Parameter x: `[b, h, w, inChs]` (NHWC). Returns `[b, h, w, outChs]`.
@@ -61,7 +70,8 @@ public struct DepthwiseSeparableConv {
         h = conv2d(h, convPW, padding: IntOrPair(0))
         h = Lambda.batchNormInference(h, weight: bn2.weight, bias: bn2.bias,
                                       runningMean: bn2.runningMean, runningVar: bn2.runningVar)
-        return h                                // bn2 applies no activation (pw_act == false)
+        // bn2 applies no activation (pw_act == false). drop_path is Identity at inference.
+        return hasSkip ? h + x : h
     }
 }
 
