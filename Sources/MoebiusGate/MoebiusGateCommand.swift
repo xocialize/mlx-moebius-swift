@@ -26,6 +26,9 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a DWResnetBlock2D fixture (path to its .safetensors).")
     var resnetGate: String?
 
+    @Option(help: "Gate a GLUMBConv (FFN) fixture (path to its .safetensors).")
+    var ffnGate: String?
+
     @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
     var normEps: Float?
 
@@ -39,7 +42,29 @@ struct MoebiusGate: ParsableCommand {
         if lambdaGate { try runLambdaGate(); ran = true }
         if let convGate { try runConvGate(path: convGate); ran = true }
         if let resnetGate { try runResnetGate(path: resnetGate); ran = true }
+        if let ffnGate { try runFFNGate(path: ffnGate); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
+    }
+
+    /// Gate one `GLUMBConv` FFN. Its I/O is sequence-form [b, n, c], so no layout transpose.
+    private func runFFNGate(path: String) throws {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw MoebiusError.fixtureNotFound(url.path)
+        }
+        let bundle = try MLX.loadArrays(url: url)
+        var weights: [String: MLXArray] = [:]
+        for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
+        guard let x = bundle["io.input0"], let ref = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.input0 / io.output")
+        }
+        print("\n\(url.deletingPathExtension().lastPathComponent)  \(x.shape) -> \(ref.shape)")
+        let block = try GLUMBConv(weights)
+        let out = block(x)
+        eval(out)
+        let failures = report("glu mbconv", out, ref)
+        print(failures == 0 ? "FFN GATE: PASS" : "FFN GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate one `DWResnetBlock2D` against its captured (hidden_states, temb) → output.
