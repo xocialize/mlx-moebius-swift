@@ -29,6 +29,9 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a GLUMBConv (FFN) fixture (path to its .safetensors).")
     var ffnGate: String?
 
+    @Option(help: "Gate a MixTransformerBlock fixture (path to its .safetensors).")
+    var blockGate: String?
+
     @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
     var normEps: Float?
 
@@ -43,7 +46,31 @@ struct MoebiusGate: ParsableCommand {
         if let convGate { try runConvGate(path: convGate); ran = true }
         if let resnetGate { try runResnetGate(path: resnetGate); ran = true }
         if let ffnGate { try runFFNGate(path: ffnGate); ran = true }
+        if let blockGate { try runBlockGate(path: blockGate); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
+    }
+
+    /// Gate a whole `MixTransformerBlock` — the first COMPOSITE gate, exercising norm1/attn1,
+    /// norm2/attn2 and norm3/ff together with their residuals.
+    private func runBlockGate(path: String) throws {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw MoebiusError.fixtureNotFound(url.path)
+        }
+        let bundle = try MLX.loadArrays(url: url)
+        var weights: [String: MLXArray] = [:]
+        for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
+        guard let x = bundle["io.input0"], let ctx = bundle["io.kw_encoder_hidden_states"],
+              let ref = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.input0 / io.kw_encoder_hidden_states / io.output")
+        }
+        print("\n\(url.deletingPathExtension().lastPathComponent)  x \(x.shape) ctx \(ctx.shape) -> \(ref.shape)")
+        let block = try MixTransformerBlock(weights)
+        let out = block(x, context: ctx)
+        eval(out)
+        let failures = report("mix transformer", out, ref)
+        print(failures == 0 ? "BLOCK GATE: PASS" : "BLOCK GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate one `GLUMBConv` FFN. Its I/O is sequence-form [b, n, c], so no layout transpose.
