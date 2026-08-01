@@ -1,5 +1,8 @@
 import ArgumentParser
+import CoreGraphics
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import MLX
 import MLXNN
 import MoebiusMLX
@@ -51,6 +54,12 @@ struct MoebiusGate: ParsableCommand {
     @Flag(help: "Gate the VAE encoder (posterior mean) and decoder.")
     var vaeGate: Bool = false
 
+    @Flag(help: "Run the FULL pipeline against the oracle's own latents and compare decoded images.")
+    var pipelineGate: Bool = false
+
+    @Option(help: "Write the pipeline's decoded image here (PNG).")
+    var outputImage: String?
+
     @Option(help: "Converted VAE (safetensors).")
     var vaeCheckpoint: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/converted/moebius-vae-fp32.safetensors"
 
@@ -81,6 +90,7 @@ struct MoebiusGate: ParsableCommand {
         if unetGate { try runUNetGate(); ran = true }
         if ddimGate { try runDDIMGate(); ran = true }
         if vaeGate { try runVAEGate(); ran = true }
+        if pipelineGate { try runPipelineGate(); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
     }
 
@@ -94,6 +104,89 @@ struct MoebiusGate: ParsableCommand {
         for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
         print("\n\(url.deletingPathExtension().lastPathComponent)")
         return (weights, bundle)
+    }
+
+    /// The decisive gate: the whole pipeline, 19 steps, against the oracle's decoded image.
+    ///
+    /// The oracle's VAE draw and noise are INJECTED so the two runs are comparable — otherwise the
+    /// stochastic `encode().sample()` alone would make them different (valid) images.
+    private func runPipelineGate() throws {
+        let started = Date()
+        let unetWeights = try MLX.loadArrays(url: URL(fileURLWithPath: checkpoint))
+        let vaeWeights = try MLX.loadArrays(url: URL(fileURLWithPath: vaeCheckpoint))
+        let fx = try MLX.loadArrays(url: URL(fileURLWithPath: unetFixture))
+        guard let latents = fx["io.latents"], let maskedLatents = fx["io.masked_latents"],
+              let maskLatent = fx["io.resized_masks"], let noise = fx["io.noise"],
+              let ref = fx["io.decoded"] else {
+            throw MoebiusError.missingWeight("pipeline goldens")
+        }
+        let vae = AutoencoderKL()
+        try vae.update(parameters: ModuleParameters.unflattened(AutoencoderKL.sanitize(vaeWeights)),
+                       verify: [.all])
+        eval(vae)
+        let pipeline = MoebiusPipeline(unet: try MoebiusUNet(unetWeights), vae: vae)
+        print("\npipeline  cfg=\(pipeline.guidanceScale) strength=\(pipeline.strength) steps=\(pipeline.numSteps)")
+
+        let inputs = MoebiusPipeline.Inputs(latents: latents, maskedLatents: maskedLatents,
+                                            maskLatent: maskLatent, noise: noise)
+        let image = pipeline.run(inputs) { step, total in
+            FileHandle.standardError.write(Data("  step \(step)/\(total)\r".utf8))
+        }
+        FileHandle.standardError.write(Data("\n".utf8))
+
+        // A 19-step trajectory AMPLIFIES per-step precision differences, so pixel-comparing a GPU
+        // run against a CPU-computed golden is the wrong gate — the same reason the porting skill
+        // says not to gate quantized generative models on PSNR-vs-golden: the run lands on a
+        // different but equally valid image. Measured here: GPU vs the CPU golden is rel 2.5e-01
+        // with cos 0.99986, and the two images are visually indistinguishable.
+        //   • CPU lane  -> pixel parity against the oracle (the real correctness gate)
+        //   • GPU lane  -> structural agreement (cosine) + a visual sample
+        let failures: Int
+        if cpu {
+            failures = report("decoded image", image, ref, tolerance: VAE_FP32_TOLERANCE)
+        } else {
+            let a = image.reshaped([-1]), b = ref.reshaped([-1])
+            let scale = MLX.maximum(MLX.abs(b).max(), MLXArray(Float(1e-20)))
+            let an = a / scale, bn = b / scale
+            let cos = (an * bn).sum().item(Float.self)
+                / (sqrt(an.square().sum().item(Float.self)) * sqrt(bn.square().sum().item(Float.self)))
+            let ok = cos > 0.999
+            print(String(format: "  decoded image (GPU)    cos=%.9f   [%@ — structural gate; pixel parity is CPU-lane only]",
+                         cos, ok ? "PASS" : "FAIL"))
+            failures = ok ? 0 : 1
+        }
+        print(String(format: "  %.1f s for %d steps", Date().timeIntervalSince(started), 19))
+        if let outputImage {
+            try writePNG(image, to: URL(fileURLWithPath: outputImage))
+            print("  wrote \(outputImage)")
+        }
+        print(failures == 0 ? "PIPELINE GATE: PASS" : "PIPELINE GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
+    }
+
+    /// Write an NCHW [0,1] image as PNG.
+    private func writePNG(_ imageNCHW: MLXArray, to url: URL) throws {
+        let h = imageNCHW.dim(2), w = imageNCHW.dim(3)
+        let hwc = MLX.clip(imageNCHW[0].transposed(1, 2, 0) * 255, min: 0, max: 255).asType(.uint8)
+        eval(hwc)
+        let bytes: [UInt8] = hwc.asArray(UInt8.self)
+        var rgba = [UInt8](repeating: 255, count: w * h * 4)
+        for i in 0 ..< (w * h) {
+            rgba[i * 4] = bytes[i * 3]; rgba[i * 4 + 1] = bytes[i * 3 + 1]
+            rgba[i * 4 + 2] = bytes[i * 3 + 2]
+        }
+        let provider = CGDataProvider(data: Data(rgba) as CFData)!
+        let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                         bytesPerRow: w * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                         bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                         provider: provider, decode: nil, shouldInterpolate: false,
+                         intent: .defaultIntent)!
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            throw MoebiusError.fixtureNotFound(url.path)
+        }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest) else { throw MoebiusError.fixtureNotFound(url.path) }
     }
 
     /// The VAE's fp32 accumulation floor, MEASURED rather than chosen.
