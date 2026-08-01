@@ -139,6 +139,15 @@ struct MoebiusGate: ParsableCommand {
         // says not to gate quantized generative models on PSNR-vs-golden: the run lands on a
         // different but equally valid image. Measured here: GPU vs the CPU golden is rel 2.5e-01
         // with cos 0.99986, and the two images are visually indistinguishable.
+        //
+        // CHASED, NOT ASSUMED (2026-08-01). Two probes rule out a GPU-specific defect:
+        //   1. ONE UNet forward on GPU vs the CPU golden: rel 1.671e-03, cos 0.9999998 — inside
+        //      the known fp32 accumulation envelope (~8e-4/op through a 226M stack). The 19-step
+        //      drift is therefore iteration of an in-envelope per-step delta, not a bad kernel.
+        //   2. Two GPU pipeline runs are BIT-IDENTICAL to each other — fully deterministic, so
+        //      nothing nondeterministic is misfiring; the CPU/GPU gap is systematic rounding only.
+        // The NAX split-K GEMM registry bug (mlx#3797) does not apply: it needs half-precision
+        // with K >= 10240, and this pipeline is fp32 with max K = 1600.
         //   • CPU lane  -> pixel parity against the oracle (the real correctness gate)
         //   • GPU lane  -> structural agreement (cosine) + a visual sample
         let failures: Int
