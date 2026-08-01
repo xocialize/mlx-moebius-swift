@@ -113,10 +113,21 @@ public struct MultiQuerySelfLambda {
         // Positional term (LOCAL). The reference applies Conv3d(dimU -> dimK, (1,r,r)) to V viewed
         // as [b, u, v, hh, ww]. With dimU == 1 and kernel depth 1 that is exactly a 2-D conv run
         // independently over each of the v depth-slices, so v folds into the batch axis.
+        //
+        // ⚠️ NOT expressed as conv2d — measured 2026-08-01: MLX's conv path for a single-input-
+        // channel 15×15 kernel runs at <1% of GEMM efficiency (20.8 ms at 64², which made this
+        // ONE op ~half the whole UNet forward). The identical computation as an im2col unfold +
+        // one [·, r·r] @ [r·r, dimK] matmul is 2.3 ms (9×), rel 6e-04 in fp16 — pure reduction
+        // order. Revisit if MLX ever ships a fast small-channel conv.
         var Vp = Vn.reshaped([b, n, u, dimV])
-        Vp = Vp.transposed(0, 2, 3, 1).reshaped([b * u * dimV, hh, ww, 1])
-        let w2 = posConvWeight.squeezed(axis: 2).transposed(0, 2, 3, 1)   // [dimK, r, r, dimU]
-        var lambdaP = conv2d(Vp, w2, padding: IntOrPair(r / 2)) + posConvBias
+        Vp = Vp.transposed(0, 2, 3, 1).reshaped([b * u * dimV, hh, ww])
+        let pad = r / 2
+        let sideH = hh + 2 * pad, sideW = ww + 2 * pad
+        let xp = padded(Vp, widths: [IntOrPair(0), IntOrPair(pad), IntOrPair(pad)])
+        let col = asStrided(xp, [b * u * dimV, hh, ww, r, r],
+                            strides: [sideH * sideW, sideW, 1, sideW, 1])
+        let wG = posConvWeight.squeezed(axes: [1, 2]).reshaped([dimK, r * r]).transposed(1, 0)
+        var lambdaP = matmul(col.reshaped([b * u * dimV, n, r * r]), wG) + posConvBias
         lambdaP = lambdaP.reshaped([b, u * dimV, n, dimK]).transposed(0, 2, 3, 1)  // [b,n,k,v]
         let Yp = Lambda.applyPositionalLambda(Q, lambdaP)
 

@@ -48,6 +48,9 @@ struct MoebiusGate: AsyncParsableCommand {
     @Flag(help: "Gate the WHOLE UNet against step0_pred_raw.")
     var unetGate: Bool = false
 
+    @Flag(help: "Per-stage timing profile of the UNet forward (uses --checkpoint/--unet-fixture). Stages are eval-barriered, so the stage SUM exceeds the async full-forward time — the table ranks stages; the full-forward row is the honest wall-clock.")
+    var bench: Bool = false
+
     @Flag(help: "Gate the DDIM scheduler: timestep schedule, add_noise, and one step.")
     var ddimGate: Bool = false
 
@@ -103,6 +106,7 @@ struct MoebiusGate: AsyncParsableCommand {
         if let downGate { try runDownGate(path: downGate); ran = true }
         if let upGate { try runUpGate(path: upGate); ran = true }
         if unetGate { try runUNetGate(); ran = true }
+        if bench { try runBench(); ran = true }
         if ddimGate { try runDDIMGate(); ran = true }
         if vaeGate { try runVAEGate(); ran = true }
         if pipelineGate { try runPipelineGate(); ran = true }
@@ -339,10 +343,192 @@ struct MoebiusGate: AsyncParsableCommand {
         if let lowDtype { netInput = netInput.asType(lowDtype) }
         let out = Layout.nhwcToNCHW(unet(netInput, timestep: t, inputIds: ids)).asType(.float32)
         eval(out)
+        // Steady-state per-forward timing, for the apples-to-apples CoreAI comparison: the
+        // pipeline figure includes VAE + scheduler, so it cannot be compared to a UNet-only asset.
+        var samples: [Double] = []
+        for _ in 0 ..< 20 {
+            let t0 = Date()
+            let o = unet(netInput, timestep: t, inputIds: ids)
+            eval(o)
+            samples.append(Date().timeIntervalSince(t0) * 1000)
+        }
+        samples.sort()
+        print(String(format: "  per-forward: median %.1f ms  min %.1f  max %.1f (n=20)",
+                     samples[10], samples[0], samples[19]))
+        print(String(format: "  projected 19-step CFG-2: %.2f s (UNet only)", samples[10] * 19 / 1000))
+        eval(out)
         let failures = report("UNet e2e", out, ref)
         print(String(format: "  %.1f s", Date().timeIntervalSince(started)))
         print(failures == 0 ? "UNET GATE: PASS" : "UNET GATE: FAIL")
         if failures > 0 { throw ExitCode.failure }
+    }
+
+    /// Per-stage timing profile — WHY: CoreAI-on-MPSGraph runs the SAME math (rank-4 λ matmul
+    /// forms, per-slice posConv fold) at 50 ms/forward where this port sits at ~211 ms, and the
+    /// 4× appeared there only after graph rewrites this port already had. So MLX's time must be
+    /// going somewhere MPSGraph's static compiler eliminates; this table says where to look.
+    private func runBench() throws {
+        let weights = try MLX.loadArrays(url: URL(fileURLWithPath: checkpoint))
+        let fx = try MLX.loadArrays(url: URL(fileURLWithPath: unetFixture))
+        guard let input = fx["io.step0_model_input"], let t = fx["io.timestep"],
+              let ids = fx["io.input_ids"] else {
+            throw MoebiusError.missingWeight("io.step0_model_input / io.timestep / io.input_ids")
+        }
+        let unet = try MoebiusUNet(applyDtype(weights))
+        var netInput = Layout.nchwToNHWC(input)
+        if let lowDtype { netInput = netInput.asType(lowDtype) }
+        print("bench dtype=\(modelDtype ?? "fp32")  input=\(netInput.shape)")
+
+        // Reproduce the forward's conditioning ONCE (constant across steps in production too).
+        var context = unet.embeddingLayer[ids]
+        context = matmul(context, unet.encoderHidProj.weight.transposed(1, 0))
+            + unet.encoderHidProj.bias
+        let tEmb = Timesteps.embedding(t, dim: unet.timeProjDim)
+        let emb = unet.timeEmbedding(tEmb)
+        eval(context, emb)
+
+        // Warmup + honest full-forward wall clock.
+        for _ in 0 ..< 3 { eval(unet(netInput, timestep: t, inputIds: ids)) }
+        var full: [Double] = []
+        for _ in 0 ..< 10 {
+            let t0 = Date()
+            eval(unet(netInput, timestep: t, inputIds: ids))
+            full.append(Date().timeIntervalSince(t0) * 1000)
+        }
+        print(String(format: "full forward (async, honest): median %.1f ms", full.sorted()[5]))
+
+        // Stage-by-stage with eval barriers. Times RANK stages; they do not sum to the above.
+        let iters = 10
+        var acc: [(String, Double)] = []
+        func timed(_ label: String, _ body: () -> MLXArray) -> MLXArray {
+            var out = body(); eval(out)                        // shape/compile warm
+            let t0 = Date()
+            for _ in 0 ..< iters { out = body(); eval(out) }
+            acc.append((label, Date().timeIntervalSince(t0) * 1000 / Double(iters)))
+            return out
+        }
+
+        var h = timed("conv_in") { unet.convIn(netInput) }
+        var skips: [MLXArray] = [h]
+        for (i, block) in unet.downBlocks.enumerated() {
+            let hIn = h
+            var produced: [MLXArray] = []
+            h = timed("down_\(i)") {
+                let (out, p) = block(hIn, temb: emb, context: context)
+                produced = p
+                return out
+            }
+            skips.append(contentsOf: produced)
+        }
+        for (i, block) in unet.upBlocks.enumerated() {
+            let take = block.resnets.count
+            let slice = Array(skips.suffix(take))
+            skips.removeLast(take)
+            let hIn = h
+            h = timed("up_\(i)") { block(hIn, skips: slice, temb: emb, context: context) }
+        }
+        let hFinal = h
+        _ = timed("norm+conv_out") {
+            unet.convOut(siluActivation(
+                GroupNormParams.apply(hFinal, unet.convNormOut, groups: unet.groups, eps: unet.eps)))
+        }
+
+        let total = acc.reduce(0) { $0 + $1.1 }
+        print(String(format: "stage sum (barriered): %.1f ms", total))
+        for (label, ms) in acc.sorted(by: { $0.1 > $1.1 }) {
+            print(String(format: "  %-14s %7.1f ms  %4.1f%%", (label as NSString).utf8String!,
+                         ms, 100 * ms / total))
+        }
+
+        // Drill: one 64² transformer's internals (down_0.attentions[0]), the level that owns
+        // ~70% of the forward. Shapes are the real ones; times use the same barriered loop.
+        acc = []
+        let tx = unet.downBlocks[0].attentions[0]
+        let b = netInput.dim(0)
+        let xs = sin(MLXArray(0 ..< (b * 64 * 64 * 320)).reshaped([b, 64, 64, 320])
+            .asType(.float32) * 0.001).asType(netInput.dtype)
+        let tok = xs.reshaped([b, 4096, 320])
+        let blk = tx.blocks[0]
+        eval(xs, tok)
+        _ = timed("tx2d_64 whole") { tx(xs, context: context) }
+        _ = timed("selfλ_64") { blk.attn1.sequence(tok) }
+        _ = timed("crossλ_64") { blk.attn2.sequence(tok, context: context) }
+        _ = timed("glumb_64") { blk.ff(tok) }
+        _ = timed("ln_x3+residuals") {
+            LayerNormParams.apply(
+                LayerNormParams.apply(
+                    LayerNormParams.apply(tok, blk.norm1, eps: blk.eps) + tok,
+                    blk.norm2, eps: blk.eps) + tok,
+                blk.norm3, eps: blk.eps) + tok
+        }
+        print("\ndrill: down_0.attentions[0] internals at 64² (barriered, ranks only)")
+        for (label, ms) in acc.sorted(by: { $0.1 > $1.1 }) {
+            print(String(format: "  %-16s %7.1f ms", (label as NSString).utf8String!, ms))
+        }
+
+        // Drill 2: inside self-λ (the 81% component). Replicates MultiQuerySelfLambda's forward
+        // op-for-op so each op can be timed alone. Two prime suspects: the 15×15 conv with ONE
+        // input channel over an 80-slice batch, and the [8192 × (8×40 @ 40×40)] tiny batched
+        // matmul — both shapes a static compiler fuses/lowers better than a dynamic dispatcher.
+        acc = []
+        let sl = blk.attn1
+        let hh = 64, ww = 64, n = hh * ww
+        let hcount = sl.heads, u = sl.dimU, r = sl.r
+        let x4 = xs
+        let q = matmul(x4, sl.toQ.squeezed(axes: [2, 3]).transposed(1, 0))
+        let v0 = matmul(x4, sl.toV.squeezed(axes: [2, 3]).transposed(1, 0))
+        let Qn = Lambda.batchNormInference(q, weight: sl.normQ.weight, bias: sl.normQ.bias,
+                                           runningMean: sl.normQ.runningMean,
+                                           runningVar: sl.normQ.runningVar)
+        let Vn = Lambda.batchNormInference(v0, weight: sl.normV.weight, bias: sl.normV.bias,
+                                           runningMean: sl.normV.runningMean,
+                                           runningVar: sl.normV.runningVar)
+        let dimK = Qn.shape.last! / hcount
+        let dimV = Vn.shape.last! / u
+        let Q = Qn.reshaped([b, n, hcount, dimK]).transposed(0, 2, 3, 1)
+        let Vp0 = Vn.reshaped([b, n, u, dimV]).transposed(0, 2, 3, 1)
+            .reshaped([b * u * dimV, hh, ww, 1])
+        let w2 = sl.posConvWeight.squeezed(axis: 2).transposed(0, 2, 3, 1)
+        var lambdaP = conv2d(Vp0, w2, padding: IntOrPair(r / 2)) + sl.posConvBias
+        lambdaP = lambdaP.reshaped([b, u * dimV, n, dimK]).transposed(0, 2, 3, 1)
+        eval(Q, Vp0, w2, lambdaP)
+
+        _ = timed("q proj+bn") {
+            Lambda.batchNormInference(
+                matmul(x4, sl.toQ.squeezed(axes: [2, 3]).transposed(1, 0)),
+                weight: sl.normQ.weight, bias: sl.normQ.bias,
+                runningMean: sl.normQ.runningMean, runningVar: sl.normQ.runningVar)
+        }
+        _ = timed("posConv 15×15") {
+            conv2d(Vp0, w2, padding: IntOrPair(r / 2)) + sl.posConvBias
+        }
+        _ = timed("applyPosLambda") { Lambda.applyPositionalLambda(Q, lambdaP) }
+
+        // Candidate fix: the SAME conv as im2col + one GEMM. conv2d with inC=1 and a 15×15
+        // kernel runs at <1% GEMM efficiency in MLX; the 225-tap unfold + [·,225]@[225,40]
+        // matmul is numerically identical and bandwidth-bound.
+        let pad = r / 2
+        let bv = b * u * dimV
+        let side = hh + 2 * pad
+        let wG = w2.reshaped([dimK, r * r]).transposed(1, 0)          // [225, dimK]
+        func posConvIm2col() -> MLXArray {
+            let xp = padded(Vp0.squeezed(axis: 3),
+                            widths: [IntOrPair(0), IntOrPair(pad), IntOrPair(pad)])
+            let col = asStrided(xp, [bv, hh, ww, r, r],
+                                strides: [side * side, side, 1, side, 1])
+            return matmul(col.reshaped([bv, n, r * r]), wG) + sl.posConvBias
+        }
+        let want = (conv2d(Vp0, w2, padding: IntOrPair(pad)) + sl.posConvBias)
+            .reshaped([bv, n, dimK]).asType(.float32)
+        let got = posConvIm2col().asType(.float32)
+        eval(want, got)
+        let gap = (want - got).abs().max().item(Float.self) / want.abs().max().item(Float.self)
+        print(String(format: "\nim2col vs conv2d: rel %.3e %@", gap, gap < 2e-3 ? "OK" : "DIVERGES"))
+        _ = timed("posConv im2col") { posConvIm2col() }
+        print("\ndrill 2: self-λ internals at 64²")
+        for (label, ms) in acc.sorted(by: { $0.1 > $1.1 }) {
+            print(String(format: "  %-16s %7.1f ms", (label as NSString).utf8String!, ms))
+        }
     }
 
     /// Gate a whole up block — skip concat (LIFO) -> resnet -> attention, then upsample.
