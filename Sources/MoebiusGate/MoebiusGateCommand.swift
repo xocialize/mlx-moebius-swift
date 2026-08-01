@@ -38,6 +38,9 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a DWMixTFDownBlock2D (down_blocks.N) fixture.")
     var downGate: String?
 
+    @Option(help: "Gate a DWMixTFUpBlock2D (up_blocks.N) fixture.")
+    var upGate: String?
+
     @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
     var normEps: Float?
 
@@ -55,6 +58,7 @@ struct MoebiusGate: ParsableCommand {
         if let blockGate { try runBlockGate(path: blockGate); ran = true }
         if let attnGate { try runAttnGate(path: attnGate); ran = true }
         if let downGate { try runDownGate(path: downGate); ran = true }
+        if let upGate { try runUpGate(path: upGate); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
     }
 
@@ -68,6 +72,28 @@ struct MoebiusGate: ParsableCommand {
         for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
         print("\n\(url.deletingPathExtension().lastPathComponent)")
         return (weights, bundle)
+    }
+
+    /// Gate a whole up block — skip concat (LIFO) -> resnet -> attention, then upsample.
+    private func runUpGate(path: String) throws {
+        let (weights, bundle) = try loadFixture(path)
+        guard let x = bundle["io.kw_hidden_states"], let temb = bundle["io.kw_temb"],
+              let ctx = bundle["io.kw_encoder_hidden_states"], let ref = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.kw_hidden_states / io.kw_temb / io.kw_encoder_hidden_states / io.output")
+        }
+        // Skips arrive as kw_res_hidden_states_tuple_<i>, in production order.
+        var skips: [MLXArray] = []
+        var i = 0
+        while let s = bundle["io.kw_res_hidden_states_tuple_\(i)"] {
+            skips.append(Layout.nchwToNHWC(s)); i += 1
+        }
+        let block = try DWMixTFUpBlock2D(weights)
+        print("  layers=\(block.resnets.count) skips=\(skips.count) upsampler=\(block.upsampler != nil)")
+        let out = Layout.nhwcToNCHW(block(Layout.nchwToNHWC(x), skips: skips, temb: temb, context: ctx))
+        eval(out)
+        let failures = report("up block", out, ref)
+        print(failures == 0 ? "UP GATE: PASS" : "UP GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate a `MixTransformer2DModel` — norm / proj_in / blocks / proj_out / residual, spatial I/O.
