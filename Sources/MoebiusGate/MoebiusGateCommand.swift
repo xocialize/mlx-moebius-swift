@@ -20,17 +20,41 @@ struct MoebiusGate: ParsableCommand {
     @Flag(help: "Gate the LλMI block (self + cross) against the PyTorch reference.")
     var lambdaGate: Bool = false
 
+    @Option(help: "Gate a DepthwiseSeparableConv block fixture (path to its .safetensors).")
+    var convGate: String?
+
     @Flag(inversion: .prefixedNo,
           help: "Pin to the CPU stream — GPU fp32 noise (~8e-4/op) both hides and mimics op bugs. Use --no-cpu for a GPU smoke.")
     var cpu: Bool = true
 
     mutating func run() throws {
         if cpu { Device.setDefault(device: Device(.cpu)) }
-        guard lambdaGate else {
-            print("nothing to do — pass --lambda-gate")
-            return
+        var ran = false
+        if lambdaGate { try runLambdaGate(); ran = true }
+        if let convGate { try runConvGate(path: convGate); ran = true }
+        if !ran { print("nothing to do — pass --lambda-gate and/or --conv-gate <fixture>") }
+    }
+
+    /// Gate one `DepthwiseSeparableConv` (conv_in / conv_out) against its captured I/O.
+    private func runConvGate(path: String) throws {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw MoebiusError.fixtureNotFound(url.path)
         }
-        try runLambdaGate()
+        let bundle = try MLX.loadArrays(url: url)
+        var weights: [String: MLXArray] = [:]
+        for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
+        guard let inNCHW = bundle["io.input"], let refNCHW = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.input / io.output")
+        }
+        print("\n\(url.deletingPathExtension().lastPathComponent)  in \(inNCHW.shape) -> out \(refNCHW.shape)")
+
+        let block = try DepthwiseSeparableConv(weights)
+        let out = Layout.nhwcToNCHW(block(Layout.nchwToNHWC(inNCHW)))
+        eval(out)
+        let failures = report("dwsep conv", out, refNCHW)
+        print(failures == 0 ? "CONV GATE: PASS" : "CONV GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     private func runLambdaGate() throws {
