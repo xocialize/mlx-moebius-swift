@@ -44,6 +44,9 @@ struct MoebiusGate: ParsableCommand {
     @Flag(help: "Gate the WHOLE UNet against step0_pred_raw.")
     var unetGate: Bool = false
 
+    @Flag(help: "Gate the DDIM scheduler: timestep schedule, add_noise, and one step.")
+    var ddimGate: Bool = false
+
     @Option(help: "Converted checkpoint (safetensors) for the UNet gate.")
     var checkpoint: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/converted/moebius-ft_places2-fp32.safetensors"
 
@@ -69,6 +72,7 @@ struct MoebiusGate: ParsableCommand {
         if let downGate { try runDownGate(path: downGate); ran = true }
         if let upGate { try runUpGate(path: upGate); ran = true }
         if unetGate { try runUNetGate(); ran = true }
+        if ddimGate { try runDDIMGate(); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
     }
 
@@ -82,6 +86,35 @@ struct MoebiusGate: ParsableCommand {
         for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
         print("\n\(url.deletingPathExtension().lastPathComponent)")
         return (weights, bundle)
+    }
+
+    /// Gate DDIM: the schedule itself, add_noise, and one deterministic step.
+    private func runDDIMGate() throws {
+        let fx = try MLX.loadArrays(url: URL(fileURLWithPath: unetFixture))
+        guard let latents = fx["io.latents"], let noise = fx["io.noise"],
+              let noisyInitial = fx["io.noisy_initial"], let predCFG = fx["io.step0_pred_cfg"],
+              let latentsOut = fx["io.step0_latents_out"], let t = fx["io.timestep"] else {
+            throw MoebiusError.missingWeight("ddim goldens")
+        }
+        var sched = DDIMScheduler()
+        sched.setTimesteps(20)
+        sched.applyStrength(0.99)
+        let first = sched.timesteps[0]
+        let expected = Int(t[0].item(Int32.self))
+        print("\nDDIM  steps=\(sched.timesteps.count) first=\(first) (oracle timestep \(expected))")
+        var failures = first == expected ? 0 : 1
+        if first != expected { print("  SCHEDULE MISMATCH  [FAIL]") }
+
+        let noised = sched.addNoise(latents, noise: noise, timestep: first)
+        eval(noised)
+        failures += report("add_noise", noised, noisyInitial)
+
+        let stepped = sched.step(modelOutput: predCFG, timestep: first, sample: noisyInitial)
+        eval(stepped)
+        failures += report("one DDIM step", stepped, latentsOut)
+
+        print(failures == 0 ? "DDIM GATE: PASS" : "DDIM GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate the WHOLE UNet: 9 skips, 3 down blocks, 3 up blocks, no mid block.
