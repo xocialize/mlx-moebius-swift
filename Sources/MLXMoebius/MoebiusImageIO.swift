@@ -48,7 +48,12 @@ public enum MoebiusImageIO {
         let fillCG = try toCGImage(fill512)
         let fillFull = rgbTensor(resize(fillCG, width: w, height: h))       // [1,3,h,w] [0,1]
         let sourceFull = rgbTensor(source)
-        let maskFull = binarizedMask(mask)                                   // [1,1,h,w]
+        // ⚠️ Resize the mask to the SOURCE's pixel dims before compositing. A caller may hand us
+        // a mask sized in POINTS while the image is in PIXELS — an NSImage-backed UI rasterizing
+        // at `NSImage.size` does exactly that for any asset whose DPI ≠ 72 (a 150-DPI 2250×4000
+        // PNG reports 1080×1920 points). Without this the paste multiply hits mismatched shapes
+        // and MLX aborts the process. The mask is authoritative for WHERE, never for HOW BIG.
+        let maskFull = binarizedMask(resize(mask, width: w, height: h))       // [1,1,h,w]
         let pasted = MoebiusPipeline.paste(result: fillFull, source: sourceFull, mask: maskFull)
         eval(pasted)
         return try toCGImage(pasted)
