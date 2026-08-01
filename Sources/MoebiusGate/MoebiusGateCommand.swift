@@ -26,8 +26,8 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a DWResnetBlock2D fixture (path to its .safetensors).")
     var resnetGate: String?
 
-    @Option(help: "GroupNorm epsilon to gate with. The block default is 1e-6 and the diffusers UNet default is 1e-5; the gate decides which is actually in force.")
-    var normEps: Float = 1e-6
+    @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
+    var normEps: Float?
 
     @Flag(inversion: .prefixedNo,
           help: "Pin to the CPU stream — GPU fp32 noise (~8e-4/op) both hides and mimics op bugs. Use --no-cpu for a GPU smoke.")
@@ -55,9 +55,14 @@ struct MoebiusGate: ParsableCommand {
               let refNCHW = bundle["io.output"] else {
             throw MoebiusError.missingWeight("io.input0 / io.input1 / io.output")
         }
-        print("\n\(url.deletingPathExtension().lastPathComponent)  x \(xNCHW.shape) temb \(temb.shape) -> \(refNCHW.shape)   [eps \(normEps)]")
+        print("\n\(url.deletingPathExtension().lastPathComponent)  x \(xNCHW.shape) temb \(temb.shape) -> \(refNCHW.shape)   [eps \(normEps.map(String.init(describing:)) ?? "port default")]")
 
-        let block = try DWResnetBlock2D(weights, eps: normEps)
+        let block: DWResnetBlock2D
+        if let normEps {
+            block = try DWResnetBlock2D(weights, eps: normEps)
+        } else {
+            block = try DWResnetBlock2D(weights)   // the port's measured value
+        }
         let out = Layout.nhwcToNCHW(block(Layout.nchwToNHWC(xNCHW), temb: temb))
         eval(out)
         let failures = report("dw resnet", out, refNCHW)
