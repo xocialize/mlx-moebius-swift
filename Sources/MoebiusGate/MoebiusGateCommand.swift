@@ -69,6 +69,9 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Pipeline golden bundle for the UNet gate.")
     var unetFixture: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/goldens/unet_fixture.safetensors"
 
+    @Option(help: "Cast model weights to this dtype before running (fp16|bf16). Omit for the checkpoint's own fp32. BatchNorm running stats stay fp32 regardless — a running_var that rounds toward zero makes rsqrt explode.")
+    var modelDtype: String?
+
     @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
     var normEps: Float?
 
@@ -92,6 +95,26 @@ struct MoebiusGate: ParsableCommand {
         if vaeGate { try runVAEGate(); ran = true }
         if pipelineGate { try runPipelineGate(); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
+    }
+
+    /// Cast weights for a dtype lane. BatchNorm statistics are pinned fp32 (see convert_weights.py);
+    /// everything else float takes the requested dtype. Inputs are cast by the callers so the conv
+    /// stacks genuinely COMPUTE in the low dtype rather than promoting straight back to fp32.
+    private func applyDtype(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        guard let modelDtype else { return weights }
+        let dtype: DType = modelDtype == "bf16" ? .bfloat16 : .float16
+        var out: [String: MLXArray] = [:]
+        out.reserveCapacity(weights.count)
+        for (k, v) in weights {
+            let pinned = k.hasSuffix("running_mean") || k.hasSuffix("running_var")
+            out[k] = (!pinned && v.dtype == .float32) ? v.asType(dtype) : v
+        }
+        return out
+    }
+
+    private var lowDtype: DType? {
+        guard let modelDtype else { return nil }
+        return modelDtype == "bf16" ? .bfloat16 : .float16
     }
 
     private func loadFixture(_ path: String) throws -> ([String: MLXArray], [String: MLXArray]) {
@@ -124,9 +147,12 @@ struct MoebiusGate: ParsableCommand {
         try vae.update(parameters: ModuleParameters.unflattened(AutoencoderKL.sanitize(vaeWeights)),
                        verify: [.all])
         eval(vae)
-        let pipeline = MoebiusPipeline(unet: try MoebiusUNet(unetWeights), vae: vae)
-        print("\npipeline  cfg=\(pipeline.guidanceScale) strength=\(pipeline.strength) steps=\(pipeline.numSteps)")
+        let pipeline = MoebiusPipeline(unet: try MoebiusUNet(applyDtype(unetWeights)), vae: vae)
+        print("\npipeline  cfg=\(pipeline.guidanceScale) strength=\(pipeline.strength) steps=\(pipeline.numSteps) dtype=\(modelDtype ?? "fp32")")
 
+        // The scheduler state stays fp32 (matching the reference, whose DDIM math is fp32 even in
+        // fp16 runs); only the UNet weights + its input are low-dtype. The pipeline casts the model
+        // input per step via the UNet weights' dtype — here we pre-cast the conditioning latents.
         let inputs = MoebiusPipeline.Inputs(latents: latents, maskedLatents: maskedLatents,
                                             maskLatent: maskLatent, noise: noise)
         let image = pipeline.run(inputs) { step, total in
@@ -287,10 +313,12 @@ struct MoebiusGate: ParsableCommand {
               let ids = fx["io.input_ids"], let ref = fx["io.step0_pred_raw"] else {
             throw MoebiusError.missingWeight("io.step0_model_input / io.timestep / io.input_ids / io.step0_pred_raw")
         }
-        let unet = try MoebiusUNet(weights)
-        print("  down=\(unet.downBlocks.count) up=\(unet.upBlocks.count) timestep=\(t[0].item(Int32.self))")
+        let unet = try MoebiusUNet(applyDtype(weights))
+        print("  down=\(unet.downBlocks.count) up=\(unet.upBlocks.count) timestep=\(t[0].item(Int32.self)) dtype=\(modelDtype ?? "fp32")")
 
-        let out = Layout.nhwcToNCHW(unet(Layout.nchwToNHWC(input), timestep: t, inputIds: ids))
+        var netInput = Layout.nchwToNHWC(input)
+        if let lowDtype { netInput = netInput.asType(lowDtype) }
+        let out = Layout.nhwcToNCHW(unet(netInput, timestep: t, inputIds: ids)).asType(.float32)
         eval(out)
         let failures = report("UNet e2e", out, ref)
         print(String(format: "  %.1f s", Date().timeIntervalSince(started)))

@@ -70,15 +70,22 @@ public struct MoebiusPipeline {
         let maskPair = concatenated([inputs.maskLatent, inputs.maskLatent], axis: 0)
         let maskedPair = concatenated([inputs.maskedLatents, inputs.maskedLatents], axis: 0)
 
+        // The UNet's compute dtype follows its weights (fp32, or fp16/bf16 in a dtype lane); the
+        // scheduler math stays fp32 either way, matching the reference, whose DDIM state is fp32
+        // even in fp16 runs. Without this cast a low-dtype UNet would silently promote back to
+        // fp32 at the first conv and the dtype lane would test nothing but weight rounding.
+        let computeDtype = unet.convIn.convDW.dtype
+
         for (i, t) in timesteps.enumerated() {
             let scaled = sched.scaleModelInput(noisy, timestep: t)
             let pair = concatenated([scaled, scaled], axis: 0)
             // noisy(4) | mask(1) | masked(4) — the mask is the MIDDLE channel group.
-            let modelInput = concatenated([pair, maskPair, maskedPair], axis: 1)
+            let modelInput = concatenated([pair, maskPair, maskedPair], axis: 1).asType(computeDtype)
 
             let timestepArray = MLXArray([Int32(t), Int32(t)])
             let predNCHW = Layout.nhwcToNCHW(
                 unet(Layout.nchwToNHWC(modelInput), timestep: timestepArray, inputIds: inputIds))
+                .asType(.float32)
 
             let predUncond = predNCHW[0 ..< 1]
             let predCond = predNCHW[1 ..< 2]
