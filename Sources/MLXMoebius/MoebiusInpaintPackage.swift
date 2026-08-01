@@ -33,17 +33,23 @@ public final class MoebiusInpaintPackage: ModelPackage {
             provenance: Provenance(sourceRepo: "mlx-community/Moebius-Places2-fp16",
                                    revision: "main", tier: 3),
             requirements: RequirementsManifest(
-                // Split footprint, born sweep-clean — MEASURED, not estimated (an initial 3.5 GB
-                // guess under-declared and was corrected the same day). Pipeline gate, fp16, GPU,
-                // 19 steps + VAE decode @512², batch-2 CFG:
-                //   MLX peak 5.65 GB, post-run resident 0.79 GB ⇒ activation transient ≈ 4.9 GB
-                //   (the 512² VAE decode dominates, as it does fleet-wide).
-                // residentBytes = fp16 UNet 453 MB + fp16 VAE 167 MB + graph residue ≈ 0.8 GB.
-                // [smoke MLX-peak; in-app phys re-baseline pending — smoke under-reads phys
-                //  ~2.7×, the BiRefNet lesson.]
+                // Split footprint — IN-APP phys_footprint MEASURED 2026-08-01 (Moebius Demo,
+                // ValidationHarness, isolate:true so co-residents cannot inflate the floor):
+                //   floor 1.10 GB · peak 5.21 GB · activation 4.11 GB · retained-after-run 0.67 GB
+                // This CORRECTED the prior smoke-derived declaration in BOTH directions: resident
+                // was UNDER-declared (0.80 → 1.10 GB, +38%) and activation OVER-declared
+                // (5.00 → 4.20 GB). Declared slightly above measurement for headroom.
+                //
+                // ⚠️ NOTE FOR THE FLEET, because it contradicts the standing rule: the BiRefNet
+                // lesson says a smoke MLX-peak UNDER-reads process phys ~2.7×. Here it did the
+                // OPPOSITE — smoke MLX-peak 5.65 GB vs phys peak 5.21 GB. MLX's peak counts its
+                // buffer POOL, which for an allocation-heavy transient (the 512² VAE decode) can
+                // exceed the resident pages phys actually reports. So "smoke under-reads" is not
+                // universal; it is workload-shaped, and the in-app measurement is the arbiter
+                // either way.
                 footprints: [
-                    QuantFootprint(quant: .fp16, residentBytes: 800_000_000,
-                                   peakActivationBytes: 5_000_000_000)
+                    QuantFootprint(quant: .fp16, residentBytes: 1_100_000_000,
+                                   peakActivationBytes: 4_200_000_000)
                 ],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0))
