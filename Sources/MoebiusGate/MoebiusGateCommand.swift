@@ -41,6 +41,15 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a DWMixTFUpBlock2D (up_blocks.N) fixture.")
     var upGate: String?
 
+    @Flag(help: "Gate the WHOLE UNet against step0_pred_raw.")
+    var unetGate: Bool = false
+
+    @Option(help: "Converted checkpoint (safetensors) for the UNet gate.")
+    var checkpoint: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/converted/moebius-ft_places2-fp32.safetensors"
+
+    @Option(help: "Pipeline golden bundle for the UNet gate.")
+    var unetFixture: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/goldens/unet_fixture.safetensors"
+
     @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
     var normEps: Float?
 
@@ -59,6 +68,7 @@ struct MoebiusGate: ParsableCommand {
         if let attnGate { try runAttnGate(path: attnGate); ran = true }
         if let downGate { try runDownGate(path: downGate); ran = true }
         if let upGate { try runUpGate(path: upGate); ran = true }
+        if unetGate { try runUNetGate(); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
     }
 
@@ -72,6 +82,32 @@ struct MoebiusGate: ParsableCommand {
         for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
         print("\n\(url.deletingPathExtension().lastPathComponent)")
         return (weights, bundle)
+    }
+
+    /// Gate the WHOLE UNet: 9 skips, 3 down blocks, 3 up blocks, no mid block.
+    private func runUNetGate() throws {
+        let ckptURL = URL(fileURLWithPath: checkpoint)
+        guard FileManager.default.fileExists(atPath: ckptURL.path) else {
+            throw MoebiusError.fixtureNotFound(ckptURL.path)
+        }
+        let started = Date()
+        let weights = try MLX.loadArrays(url: ckptURL)
+        print("\ncheckpoint: \(weights.count) tensors from \(ckptURL.lastPathComponent)")
+
+        let fx = try MLX.loadArrays(url: URL(fileURLWithPath: unetFixture))
+        guard let input = fx["io.step0_model_input"], let t = fx["io.timestep"],
+              let ids = fx["io.input_ids"], let ref = fx["io.step0_pred_raw"] else {
+            throw MoebiusError.missingWeight("io.step0_model_input / io.timestep / io.input_ids / io.step0_pred_raw")
+        }
+        let unet = try MoebiusUNet(weights)
+        print("  down=\(unet.downBlocks.count) up=\(unet.upBlocks.count) timestep=\(t[0].item(Int32.self))")
+
+        let out = Layout.nhwcToNCHW(unet(Layout.nchwToNHWC(input), timestep: t, inputIds: ids))
+        eval(out)
+        let failures = report("UNet e2e", out, ref)
+        print(String(format: "  %.1f s", Date().timeIntervalSince(started)))
+        print(failures == 0 ? "UNET GATE: PASS" : "UNET GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate a whole up block — skip concat (LIFO) -> resnet -> attention, then upsample.
