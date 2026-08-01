@@ -155,9 +155,11 @@ struct MoebiusGate: ParsableCommand {
         // input per step via the UNet weights' dtype — here we pre-cast the conditioning latents.
         let inputs = MoebiusPipeline.Inputs(latents: latents, maskedLatents: maskedLatents,
                                             maskLatent: maskLatent, noise: noise)
-        let image = pipeline.run(inputs) { step, total in
+        let image = try pipeline.run(inputs) { step, total in
             FileHandle.standardError.write(Data("  step \(step)/\(total)\r".utf8))
         }
+        print(String(format: "  MLX peak %.2f GB, resident %.2f GB",
+                     Double(MLX.Memory.peakMemory) / 1e9, Double(MLX.Memory.activeMemory) / 1e9))
         FileHandle.standardError.write(Data("\n".utf8))
 
         // A 19-step trajectory AMPLIFIES per-step precision differences, so pixel-comparing a GPU

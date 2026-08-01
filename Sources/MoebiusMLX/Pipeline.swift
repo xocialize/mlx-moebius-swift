@@ -53,7 +53,11 @@ public struct MoebiusPipeline {
     }
 
     /// Run the denoise loop and decode. Returns the image in `[0, 1]`, NCHW.
-    public func run(_ inputs: Inputs, progress: ((Int, Int) -> Void)? = nil) -> MLXArray {
+    ///
+    /// `onStep` fires after every committed DDIM step and MAY THROW — it is the package's
+    /// cooperative-cancellation seam (CAN-3 cadence: denoise/step) as well as its RunProgress
+    /// reporter. A thrown CancellationError propagates out unchanged.
+    public func run(_ inputs: Inputs, onStep: ((Int, Int) throws -> Void)? = nil) throws -> MLXArray {
         var sched = scheduler
         sched.setTimesteps(numSteps)
         sched.applyStrength(strength)
@@ -95,7 +99,7 @@ public struct MoebiusPipeline {
             // Per-step eval: 19 chained lazy UNet graphs would blow the Metal command-buffer
             // timeout and retain every intermediate.
             eval(noisy)
-            progress?(i + 1, timesteps.count)
+            try onStep?(i + 1, timesteps.count)
         }
 
         let decoded = (vae.decode(noisy / vae.scalingFactor) + 1) / 2

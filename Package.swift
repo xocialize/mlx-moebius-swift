@@ -19,11 +19,15 @@ let package = Package(
     platforms: [.macOS(.v26)],
     products: [
         .library(name: "MoebiusMLX", targets: ["MoebiusMLX"]),
+        .library(name: "MLXMoebius", targets: ["MLXMoebius"]),
         .executable(name: "moebius-gate", targets: ["MoebiusGate"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.3"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
+        // ≥ 0.36.0: the C14 INF gate (supersets 0.27.0's CAN gate), contract 1.24 engine-executed
+        // materialization, RunProgress.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.36.0"),
     ],
     targets: [
         .target(
@@ -32,6 +36,27 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .target(
+            name: "MLXMoebius",
+            dependencies: [
+                "MoebiusMLX",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
+            name: "MLXMoebiusTests",
+            dependencies: [
+                "MLXMoebius",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
