@@ -13,7 +13,7 @@ import MoebiusMLX
 /// (`native` build system ships none and aborts the whole process), while `swift run` does real
 /// GPU inference. Build with `--build-system swiftbuild`.
 @main
-struct MoebiusGate: ParsableCommand {
+struct MoebiusGate: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "moebius-gate",
         abstract: "Parity gates for the Moebius Swift port.")
@@ -57,6 +57,18 @@ struct MoebiusGate: ParsableCommand {
     @Flag(help: "Run the FULL pipeline against the oracle's own latents and compare decoded images.")
     var pipelineGate: Bool = false
 
+    @Flag(help: "LIVE engine gate: register -> cold materialization -> prepare -> run -> evict through a real MLXServeEngine against the PUBLISHED weights.")
+    var engineGate: Bool = false
+
+    @Option(help: "Store root for the engine gate. Omit for a throwaway temp store (true cold-download MAT proof).")
+    var engineStore: String?
+
+    @Option(help: "Input image for the engine gate (PNG).")
+    var engineImage: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/out/source_full.png"
+
+    @Option(help: "Mask for the engine gate (PNG, white = remove).")
+    var engineMask: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/out/mask_full.png"
+
     @Option(help: "Write the pipeline's decoded image here (PNG).")
     var outputImage: String?
 
@@ -79,7 +91,7 @@ struct MoebiusGate: ParsableCommand {
           help: "Pin to the CPU stream — GPU fp32 noise (~8e-4/op) both hides and mimics op bugs. Use --no-cpu for a GPU smoke.")
     var cpu: Bool = true
 
-    mutating func run() throws {
+    mutating func run() async throws {
         if cpu { Device.setDefault(device: Device(.cpu)) }
         var ran = false
         if lambdaGate { try runLambdaGate(); ran = true }
@@ -94,6 +106,11 @@ struct MoebiusGate: ParsableCommand {
         if ddimGate { try runDDIMGate(); ran = true }
         if vaeGate { try runVAEGate(); ran = true }
         if pipelineGate { try runPipelineGate(); ran = true }
+        if engineGate {
+            try await runEngineGate(store: engineStore, image: engineImage, mask: engineMask,
+                                    output: outputImage)
+            ran = true
+        }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
     }
 

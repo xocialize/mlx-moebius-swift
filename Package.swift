@@ -64,8 +64,11 @@ let package = Package(
             name: "MoebiusGate",
             dependencies: [
                 "MoebiusMLX",
+                "MLXMoebius",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
