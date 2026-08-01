@@ -32,6 +32,12 @@ struct MoebiusGate: ParsableCommand {
     @Option(help: "Gate a MixTransformerBlock fixture (path to its .safetensors).")
     var blockGate: String?
 
+    @Option(help: "Gate a MixTransformer2DModel (attentions.N) fixture.")
+    var attnGate: String?
+
+    @Option(help: "Gate a DWMixTFDownBlock2D (down_blocks.N) fixture.")
+    var downGate: String?
+
     @Option(help: "Override GroupNorm epsilon. Omit to use the value the port determined by measurement (see DWResnetBlock2D). A CLI default here would SHADOW the port's own and silently gate the wrong value.")
     var normEps: Float?
 
@@ -47,7 +53,53 @@ struct MoebiusGate: ParsableCommand {
         if let resnetGate { try runResnetGate(path: resnetGate); ran = true }
         if let ffnGate { try runFFNGate(path: ffnGate); ran = true }
         if let blockGate { try runBlockGate(path: blockGate); ran = true }
+        if let attnGate { try runAttnGate(path: attnGate); ran = true }
+        if let downGate { try runDownGate(path: downGate); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
+    }
+
+    private func loadFixture(_ path: String) throws -> ([String: MLXArray], [String: MLXArray]) {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw MoebiusError.fixtureNotFound(url.path)
+        }
+        let bundle = try MLX.loadArrays(url: url)
+        var weights: [String: MLXArray] = [:]
+        for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
+        print("\n\(url.deletingPathExtension().lastPathComponent)")
+        return (weights, bundle)
+    }
+
+    /// Gate a `MixTransformer2DModel` — norm / proj_in / blocks / proj_out / residual, spatial I/O.
+    private func runAttnGate(path: String) throws {
+        let (weights, bundle) = try loadFixture(path)
+        guard let x = bundle["io.input0"], let ctx = bundle["io.kw_encoder_hidden_states"],
+              let ref = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.input0 / io.kw_encoder_hidden_states / io.output")
+        }
+        let model = try MixTransformer2DModel(weights)
+        let out = Layout.nhwcToNCHW(model(Layout.nchwToNHWC(x), context: ctx))
+        eval(out)
+        let failures = report("transformer2d", out, ref)
+        print(failures == 0 ? "ATTN GATE: PASS" : "ATTN GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
+    }
+
+    /// Gate a whole down block — [resnet -> attention] x N, then downsample.
+    private func runDownGate(path: String) throws {
+        let (weights, bundle) = try loadFixture(path)
+        guard let x = bundle["io.kw_hidden_states"], let temb = bundle["io.kw_temb"],
+              let ctx = bundle["io.kw_encoder_hidden_states"], let ref = bundle["io.output"] else {
+            throw MoebiusError.missingWeight("io.kw_hidden_states / io.kw_temb / io.kw_encoder_hidden_states / io.output")
+        }
+        let block = try DWMixTFDownBlock2D(weights)
+        let (h, skips) = block(Layout.nchwToNHWC(x), temb: temb, context: ctx)
+        let out = Layout.nhwcToNCHW(h)
+        eval(out)
+        print("  layers=\(block.resnets.count) skips=\(skips.count) downsampler=\(block.downsampler != nil)")
+        let failures = report("down block", out, ref)
+        print(failures == 0 ? "DOWN GATE: PASS" : "DOWN GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate a whole `MixTransformerBlock` — the first COMPOSITE gate, exercising norm1/attn1,
