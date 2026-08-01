@@ -40,6 +40,7 @@ let package = Package(
             dependencies: [
                 "MoebiusMLX",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]

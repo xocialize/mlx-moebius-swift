@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import MLX
+import MLXNN
 import MoebiusMLX
 
 /// Parity gates for the Moebius Swift port, run as an EXECUTABLE.
@@ -47,6 +48,12 @@ struct MoebiusGate: ParsableCommand {
     @Flag(help: "Gate the DDIM scheduler: timestep schedule, add_noise, and one step.")
     var ddimGate: Bool = false
 
+    @Flag(help: "Gate the VAE encoder (posterior mean) and decoder.")
+    var vaeGate: Bool = false
+
+    @Option(help: "Converted VAE (safetensors).")
+    var vaeCheckpoint: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/converted/moebius-vae-fp32.safetensors"
+
     @Option(help: "Converted checkpoint (safetensors) for the UNet gate.")
     var checkpoint: String = "/Volumes/Satechi/Development/mlxengine-image/WIP/moebius-m0/converted/moebius-ft_places2-fp32.safetensors"
 
@@ -73,6 +80,7 @@ struct MoebiusGate: ParsableCommand {
         if let upGate { try runUpGate(path: upGate); ran = true }
         if unetGate { try runUNetGate(); ran = true }
         if ddimGate { try runDDIMGate(); ran = true }
+        if vaeGate { try runVAEGate(); ran = true }
         if !ran { print("nothing to do — pass --lambda-gate, --conv-gate or --resnet-gate") }
     }
 
@@ -86,6 +94,51 @@ struct MoebiusGate: ParsableCommand {
         for (k, v) in bundle where k.hasPrefix("w.") { weights[String(k.dropFirst(2))] = v }
         print("\n\(url.deletingPathExtension().lastPathComponent)")
         return (weights, bundle)
+    }
+
+    /// The VAE's fp32 accumulation floor, MEASURED rather than chosen.
+    ///
+    /// The rest of this port gates at 1e-6 relative, but that was calibrated on 64x64 UNet tensors.
+    /// The VAE runs at 512x512 with up to 512 channels — ~64x more accumulation per output — and
+    /// fp32 simply cannot hold 1e-6 there. Rather than loosen the bound by feel, the floor was
+    /// measured with the self-control the porting skill prescribes: PyTorch AGAINST ITSELF at
+    /// fp32 vs fp64 on the identical computation gives rel 2.840e-04 (encoder mean) and 8.064e-06
+    /// (decoder). Our Swift-vs-PyTorch numbers are 3.871e-04 and 1.332e-05 — the same order, within
+    /// ~1.5x of the framework's own precision floor. A real port bug would not sit there.
+    private let VAE_FP32_TOLERANCE: Float = 1e-3
+
+    /// Gate the VAE. The encoder is gated on the posterior MEAN — the reference calls `.sample()`,
+    /// whose noise draw no other framework reproduces — and the decoder on the final image.
+    private func runVAEGate() throws {
+        let url = URL(fileURLWithPath: vaeCheckpoint)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw MoebiusError.fixtureNotFound(url.path)
+        }
+        let weights = try MLX.loadArrays(url: url)
+        let fx = try MLX.loadArrays(url: URL(fileURLWithPath: unetFixture))
+        guard let image = fx["io.image"], let latentsMean = fx["io.latents_mean"],
+              let latentsFinal = fx["io.latents_final"], let decodedRef = fx["io.decoded"] else {
+            throw MoebiusError.missingWeight("vae goldens")
+        }
+        let vae = AutoencoderKL()
+        let params = ModuleParameters.unflattened(AutoencoderKL.sanitize(weights))
+        try vae.update(parameters: params, verify: [.all])
+        eval(vae)
+        print("\nVAE  \(weights.count) tensors, scalingFactor=\(vae.scalingFactor)")
+
+        var failures = 0
+        // ENCODER: posterior mean, scaled the way the pipeline scales it.
+        let mean = vae.encode(image).mean * vae.scalingFactor
+        eval(mean)
+        failures += report("encoder mean", mean, latentsMean, tolerance: VAE_FP32_TOLERANCE)
+
+        // DECODER: the pipeline decodes latents/scalingFactor then maps [-1,1] -> [0,1].
+        let decoded = (vae.decode(latentsFinal / vae.scalingFactor) + 1) / 2
+        eval(decoded)
+        failures += report("decoder", decoded, decodedRef, tolerance: VAE_FP32_TOLERANCE)
+
+        print(failures == 0 ? "VAE GATE: PASS" : "VAE GATE: FAIL")
+        if failures > 0 { throw ExitCode.failure }
     }
 
     /// Gate DDIM: the schedule itself, add_noise, and one deterministic step.
@@ -353,7 +406,8 @@ struct MoebiusGate: ParsableCommand {
     }
 
     /// Thresholds per the porting skill: single layer < 1e-4 ideal, < 1e-3 acceptable.
-    private func report(_ name: String, _ got: MLXArray, _ want: MLXArray) -> Int {
+    private func report(_ name: String, _ got: MLXArray, _ want: MLXArray,
+                        tolerance override: Float? = nil) -> Int {
         guard got.shape == want.shape else {
             print("  \(name): SHAPE \(got.shape) vs \(want.shape)  [FAIL]")
             return 1
@@ -375,7 +429,7 @@ struct MoebiusGate: ParsableCommand {
         // run by the CPU's absolute number reports a FAIL on an exact port — the calibration trap.
         let range = (want.max() - want.min()).item(Float.self)
         let rel = range > 0 ? maxAbs / range : maxAbs
-        let tolerance: Float = cpu ? 1e-6 : 5e-3
+        let tolerance: Float = override ?? (cpu ? 1e-6 : 5e-3)
         let verdict = rel < tolerance ? "PASS" : (rel < tolerance * 10 ? "ok" : "FAIL")
         print(String(format: "  %-22s max|Δ|=%.3e  rel=%.3e  cos=%.9f   [%@ vs %@ tol %.0e]",
                      (name as NSString).utf8String!, maxAbs, rel, cos, verdict,
