@@ -5,6 +5,9 @@ import MLX
 public struct Upsample2D {
     public let weight: MLXArray      // MLX [out, kH, kW, in]
     public let bias: MLXArray
+    /// `up_blocks.1`'s 640→640 conv at 64² (batch 2) is inside mlx's lossy Winograd conv2d window
+    /// (WinogradFreeConv2d.swift); `.conv3d` by default — one conv per denoise step, cheap.
+    public var convRoute: MoebiusConvRoute = MoebiusConvRoute.environmentOverride ?? .conv3d
 
     public init(_ weights: [String: MLXArray], prefix: String) throws {
         guard let w = weights["\(prefix).conv.weight"], let b = weights["\(prefix).conv.bias"] else {
@@ -19,7 +22,7 @@ public struct Upsample2D {
         // tile-vs-repeat confusion is the classic source of stride-2 checkerboard artefacts.
         var t = repeated(x, count: 2, axis: 1)
         t = repeated(t, count: 2, axis: 2)
-        return conv2d(t, weight, padding: IntOrPair(1)) + bias
+        return WinogradFreeConv2d.conv(t, weight: weight, bias: bias, padding: (1, 1), route: convRoute)
     }
 }
 

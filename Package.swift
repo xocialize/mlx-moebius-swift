@@ -51,6 +51,17 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(
+            name: "MoebiusMLXTests",
+            dependencies: [
+                "MoebiusMLX",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Tests/MoebiusMLXTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .testTarget(
             name: "MLXMoebiusTests",
             dependencies: [
                 "MLXMoebius",

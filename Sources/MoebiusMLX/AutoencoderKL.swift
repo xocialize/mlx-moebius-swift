@@ -52,9 +52,9 @@ final class VAEResnetBlock2D: Module {
 
     init(_ inCh: Int, _ outCh: Int, groups: Int = 32) {
         self._norm1.wrappedValue = GroupNorm(groupCount: groups, dimensions: inCh, eps: GN_EPS, pytorchCompatible: true)
-        self._conv1.wrappedValue = Conv2d(inputChannels: inCh, outputChannels: outCh, kernelSize: 3, padding: 1)
+        self._conv1.wrappedValue = WinogradFreeConv2d(inputChannels: inCh, outputChannels: outCh, kernelSize: 3, padding: 1)
         self._norm2.wrappedValue = GroupNorm(groupCount: groups, dimensions: outCh, eps: GN_EPS, pytorchCompatible: true)
-        self._conv2.wrappedValue = Conv2d(inputChannels: outCh, outputChannels: outCh, kernelSize: 3, padding: 1)
+        self._conv2.wrappedValue = WinogradFreeConv2d(inputChannels: outCh, outputChannels: outCh, kernelSize: 3, padding: 1)
         self._convShortcut.wrappedValue = inCh != outCh
             ? Conv2d(inputChannels: inCh, outputChannels: outCh, kernelSize: 1) : nil
         super.init()
@@ -86,7 +86,7 @@ final class VAEDownsample2D: Module {
 final class VAEUpsample2D: Module {
     @ModuleInfo(key: "conv") var conv: Conv2d
     init(_ ch: Int) {
-        self._conv.wrappedValue = Conv2d(inputChannels: ch, outputChannels: ch, kernelSize: 3, padding: 1)
+        self._conv.wrappedValue = WinogradFreeConv2d(inputChannels: ch, outputChannels: ch, kernelSize: 3, padding: 1)
         super.init()
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -184,7 +184,7 @@ final class VAEEncoder: Module {
 
     init(_ cfg: VAEConfig) {
         let boc = cfg.blockOutChannels
-        self._convIn.wrappedValue = Conv2d(inputChannels: cfg.inChannels, outputChannels: boc[0], kernelSize: 3, padding: 1)
+        self._convIn.wrappedValue = WinogradFreeConv2d(inputChannels: cfg.inChannels, outputChannels: boc[0], kernelSize: 3, padding: 1)
         var blocks: [VAEDownBlock] = []
         var inCh = boc[0]
         for (i, outCh) in boc.enumerated() {
@@ -194,7 +194,7 @@ final class VAEEncoder: Module {
         self._downBlocks.wrappedValue = blocks
         self._midBlock.wrappedValue = VAEMidBlock(boc[boc.count - 1])
         self._convNormOut.wrappedValue = GroupNorm(groupCount: cfg.normNumGroups, dimensions: boc[boc.count - 1], eps: GN_EPS, pytorchCompatible: true)
-        self._convOut.wrappedValue = Conv2d(inputChannels: boc[boc.count - 1], outputChannels: 2 * cfg.latentChannels, kernelSize: 3, padding: 1)
+        self._convOut.wrappedValue = WinogradFreeConv2d(inputChannels: boc[boc.count - 1], outputChannels: 2 * cfg.latentChannels, kernelSize: 3, padding: 1)
         super.init()
     }
 
@@ -216,7 +216,7 @@ final class VAEDecoder: Module {
     init(_ cfg: VAEConfig) {
         let rev = Array(cfg.blockOutChannels.reversed())     // [512,512,256,128]
         let nRes = cfg.layersPerBlock + 1
-        self._convIn.wrappedValue = Conv2d(inputChannels: cfg.latentChannels, outputChannels: rev[0], kernelSize: 3, padding: 1)
+        self._convIn.wrappedValue = WinogradFreeConv2d(inputChannels: cfg.latentChannels, outputChannels: rev[0], kernelSize: 3, padding: 1)
         self._midBlock.wrappedValue = VAEMidBlock(rev[0])
         var blocks: [VAEUpBlock] = []
         var inCh = rev[0]
@@ -226,7 +226,7 @@ final class VAEDecoder: Module {
         }
         self._upBlocks.wrappedValue = blocks
         self._convNormOut.wrappedValue = GroupNorm(groupCount: cfg.normNumGroups, dimensions: rev[rev.count - 1], eps: GN_EPS, pytorchCompatible: true)
-        self._convOut.wrappedValue = Conv2d(inputChannels: rev[rev.count - 1], outputChannels: cfg.outChannels, kernelSize: 3, padding: 1)
+        self._convOut.wrappedValue = WinogradFreeConv2d(inputChannels: rev[rev.count - 1], outputChannels: cfg.outChannels, kernelSize: 3, padding: 1)
         super.init()
     }
 
@@ -273,6 +273,33 @@ public final class AutoencoderKL: Module {
         self._postQuantConv.wrappedValue = Conv2d(inputChannels: lc, outputChannels: lc, kernelSize: 1)
         self.scalingFactor = scalingFactor
         super.init()
+        decoderConvRoute = .winograd
+        if let route = MoebiusConvRoute.environmentOverride {
+            encoderConvRoute = route
+            decoderConvRoute = route
+        }
+    }
+
+    /// Route for the encoder's in-window 3×3 convs (WinogradFreeConv2d.swift). Default `.conv3d`:
+    /// the image / masked-image latents feed the UNet, and the raw Winograd loss there is material.
+    public var encoderConvRoute: MoebiusConvRoute {
+        get { Self.route(of: encoder) }
+        set { Self.setRoute(newValue, in: encoder) }
+    }
+
+    /// Route for the decoder's in-window 3×3 convs. Default `.winograd` (its fp32 loss is below
+    /// 8-bit visibility); parity lanes opt in with `.conv3d`.
+    public var decoderConvRoute: MoebiusConvRoute {
+        get { Self.route(of: decoder) }
+        set { Self.setRoute(newValue, in: decoder) }
+    }
+
+    static func route(of m: Module) -> MoebiusConvRoute {
+        m.modules().lazy.compactMap { ($0 as? WinogradFreeConv2d)?.route }.first ?? .winograd
+    }
+
+    static func setRoute(_ route: MoebiusConvRoute, in m: Module) {
+        for case let conv as WinogradFreeConv2d in m.modules() { conv.route = route }
     }
 
     // ---- NHWC core ----
